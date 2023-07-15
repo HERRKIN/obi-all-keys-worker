@@ -1,0 +1,6 @@
+name = "smsworker"
+main = "src/index.ts"
+compatibility_date = "2023-07-11"
+node_compat = true
+usage_model = "unbound"
+workers_dev = true

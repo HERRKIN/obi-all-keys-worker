@@ -1,0 +1,14 @@
+diff --git a/node_modules/@tendermint/belt/index.js b/node_modules/@tendermint/belt/index.js
+index e6d12ff..43f7718 100644
+--- a/node_modules/@tendermint/belt/index.js
++++ b/node_modules/@tendermint/belt/index.js
+@@ -1,4 +1,9 @@
+ let node = false;
++// if globalThis exists and is not window, use it
++if (typeof globalThis !== 'undefined' &&  typeof window === 'undefined') {
++   self.window = globalThis;
++}
++
+ try {
+     node = (Object.prototype.toString.call(global.process) === '[object process]');
+ }
