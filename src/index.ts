@@ -7,232 +7,357 @@
  *
  * Learn more at https://developers.cloudflare.com/workers/
  */
-import { entropyToMnemonicAsync } from "./utils/bip39";
-import { DecryptMessage } from "./decryptMessage";
-import { english_words } from "./words.json";
-import { sendText } from "./twilio";
-import { sha256 } from "js-sha256";
-import { getChainData } from "./utils";
-import { Slip10RawIndex } from "@cosmjs/crypto";
+
 import { base64ToBytes, bytesToBase64 } from "@tendermint/belt";
+
+import { getWalletData } from "./walletHandling";
+import { Twilio } from "./twilio";
+import { TwilioError, TwilioResponse } from "./twilio/types";
+import { sendTelegramMessage } from "./telegram";
+import { Context, Hono } from "hono";
+import { cors } from 'hono/cors'
 import { ecdsaSign } from "secp256k1";
-
 import {
-  AminoMsg,
-  Secp256k1HdWallet,
-  coins,
-  pubkeyToAddress,
-  pubkeyType,
-} from "@cosmjs/amino";
-import { SigningStargateClient, StargateClient } from "@cosmjs/stargate";
+  decryptM,
+  getSendToNumber,
+  getUUID,
+  isValidEnumValue,
+  validateStoredData,
+} from "./utils";
 
-// import { createMasterKeyFromMnemonic } from "@tendermint/sig";
-// import { createWalletFromMnemonic } from "@tendermint/sig";
-import { createWalletFromMnemonic } from "@tendermint/sig";
-
-const DEBUG_MODE = true;
-export interface Env {
-  // Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-  // MY_KV_NAMESPACE: KVNamespace;
-  //
-  // Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-  // MY_DURABLE_OBJECT: DurableObjectNamespace;
-  //
-  // Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-  // MY_BUCKET: R2Bucket;
-  //
-  // Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-  // MY_SERVICE: Fetcher;
+export enum ComunicationType {
+  SMS = "sms",
+  VOICE = "voice",
+  TELEGRAM = "telegram",
 }
 
-// const client = Twilio(accountSid, authToken);
-type requestBody = {
-  To: string;
-  Parameters: { trigger_body: { body: string; voice: boolean } };
+export enum Intents {
+  Handle = "handle",
+  Sign = "sign",
+  Pubkey = "pubkey",
+  Decrypt = "decrypt",
+}
+export interface Env {
+  Bindings: {
+    MAGIC_CODES_KV: KVNamespace;
+  };
+  variables: {
+    TWILIO_ACCOUNT_SID: string;
+    TWILIO_AUTH_TOKEN: string;
+    TWILIO_FROM: string;
+    TELEGRAM_BOT_TOKEN: string;
+  };
+}
+type ComunicationData = {
+  type: ComunicationType;
+  message: string;
+  number: string;
 };
 
-export default {
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
-    const contentType = request.headers.get("content-type");
-    if (contentType !== "application/json") {
-      return new Response("Bad Request", { status: 400 });
-    }
-    // console.log(JSON.stringify(env), JSON.stringify(request.cf));
-    // grab text and number from request body
-    const req: requestBody = await request.json();
-    // console.log(req);
-    const { To, Parameters } = req;
-    // console.log(text, number);
-    // // return new Response(JSON.stringify(request.cf), { status: 200 });
-    // return sendText({ message: text, number: number });
-    const decryptedMessage = await DecryptMessage(
-      req.Parameters.trigger_body.body
+const app = new Hono<Env>();
+
+const saveDataAndSendCode = async ({
+  pubkey,
+  sendToNumber,
+  via,
+  c,
+  data,
+}: {
+  pubkey: string;
+  sendToNumber: string;
+  via: ComunicationType;
+  c: Context;
+  data: unknown;
+}) => {
+  const id = await getUUID();
+  await c.env.MAGIC_CODES_KV.put(pubkey + "-" + id, JSON.stringify(data), {
+    expirationTtl: 300,
+  });
+
+  await manageCommunication(
+    {
+      type: via,
+      message: id,
+      number: sendToNumber,
+    },
+    c,
+  );
+  return c.json({ message: "Code sent to " + sendToNumber });
+};
+
+const checkEmptyOrUndefined = (value: string | undefined) => {
+  return value === "" || value === undefined;
+};
+const getDeterministicEntropy = (shares: {
+  [key: string]: string; // Add index signature
+}): string => {
+  let concatenated = new Uint8Array();
+  for (const key in shares) {
+    const decoded = base64ToBytes(shares[key].trim());
+    const newConcatenated = new Uint8Array(
+      concatenated.length + decoded.length,
     );
-    // if res.action is defined, then we have a valid response
-    if (!("action" in decryptedMessage)) {
-      return new Response(JSON.stringify(decryptedMessage), { status: 400 });
-    }
+    newConcatenated.set(concatenated, 0);
+    newConcatenated.set(decoded, concatenated.length);
+    concatenated = newConcatenated;
+  }
+  return bytesToBase64(concatenated);
+};
 
-    //TODO: check below
-    // Occassionally, US numbers will be passed without the preceding
-    // country code - check for this eventuality and fix it
-    // We need 100% consistency of number, after all
-    const sendToNumber = To[0] === "+" ? To : `+1${To}`;
-    let entropyMod = sendToNumber.substring(1) + +decryptedMessage.answer;
-    //   +context.DETERMINISTIC_ENTROPY;
-    var hash = sha256.hex(entropyMod);
+const handler = async (c: Context) => {
+  if (
+    checkEmptyOrUndefined(c.env.SHARE_A) ||
+    checkEmptyOrUndefined(c.env.SHARE_B) ||
+    checkEmptyOrUndefined(c.env.SHARE_C) ||
+    checkEmptyOrUndefined(c.env.SHARE_D)
+  ) {
+    return c.json(
+      {
+        message: "Please check the shares in the env variables",
+      },
+      400,
+    );
+  }
 
-    let mnem = await entropyToMnemonicAsync(hash, english_words);
+  const intent = c.req.param("intent") as Intents;
+  // code is optional
+  const query = c.req.query();
+  // check if the code is in the query and its 8chars long
+  if (Object.keys(query).includes("code") && query.code.length < 8) {
+    return c.json(
+      {
+        message: "Invalid code",
+      },
+      400,
+    );
+  }
 
-    const chainData = getChainData(decryptedMessage.chain);
-    if (!chainData) {
-      return new Response(`Invalid Chain ${decryptedMessage.chain}`, {
-        status: 400,
+  const body = await c.req.json();
+  if (!intent || !isValidEnumValue(Intents, intent)) {
+    return c.text("Invalid request");
+  }
+
+  // validate the intent is valid using the enum
+  if (isValidEnumValue(Intents, intent) === false) {
+    return c.json(
+      {
+        message: "Invalid intent " + intent,
+      },
+      400,
+    );
+  }
+  const { answer, to, via, ...rest } = body;
+  // validate the communication type
+  if (isValidEnumValue(ComunicationType, via) === false) {
+    return c.json({ message: "Invalid communication type " + via });
+  }
+  if (!answer || !to) {
+    return c.json({
+      message: "Invalid request to " + intent,
+      req: body,
+    });
+  }
+  const sendToNumber = getSendToNumber(to, via);
+  const entropy = getDeterministicEntropy({
+    SHARE_A: c.env.SHARE_A,
+    SHARE_B: c.env.SHARE_B,
+    SHARE_C: c.env.SHARE_C,
+    SHARE_D: c.env.SHARE_D,
+  });
+
+  const { wallet } = await getWalletData({
+    entropyMod: entropy + sendToNumber.replace("+", "") + answer,
+  });
+
+  const { publicKey } = wallet;
+  const pubkey = bytesToBase64(publicKey);
+
+  switch (intent) {
+    case Intents.Handle: {
+      const { signHashes, decryptMessages } = rest;
+      const data = {
+        intent,
+        body: {
+          to,
+          via,
+          answer,
+          signHashes,
+          decryptMessages,
+        },
+      };
+
+      if (!query.code) {
+        return await saveDataAndSendCode({
+          pubkey,
+          sendToNumber,
+          via,
+          c,
+          data,
+        });
+      }
+      try {
+        await validateStoredData(pubkey, query.code, data, c);
+      } catch (e) {
+        const error = e as unknown as Error;
+        return c.json({ message: error.message }, 404);
+      }
+
+      const [signedHashes, decryptedMessages] = await Promise.all([
+        await Promise.all(
+          signHashes.map(async (hash: string) => {
+            return ecdsaSign(base64ToBytes(hash), wallet.privateKey);
+          }),
+        ),
+        await decryptMessages(decryptMessages, wallet),
+      ]);
+
+      return c.json({
+        publicKey: pubkey,
+        signedHashes,
+        decryptedMessages,
       });
     }
-    const { rpc, prefix, denom, derivation } = chainData;
 
-    console.log(decryptedMessage);
-
-    const this_hdpath = [
-      Slip10RawIndex.hardened(44),
-      Slip10RawIndex.hardened(derivation),
-      Slip10RawIndex.hardened(0),
-      Slip10RawIndex.normal(0),
-      Slip10RawIndex.normal(0),
-    ];
-    // IMPORTANT: callback needs to make sure it is sending back to FROM number, and not just replying to a potential spoofer
-    const options = {
-      /** The password to use when deriving a BIP39 seed from a mnemonic. */
-      bip39Password: "",
-      /** The bech32 address prefix (human readable part). Defaults to "cosmos". */
-      prefix: prefix,
-      hdPaths: [this_hdpath],
-    };
-
-    const wallet = await Secp256k1HdWallet.fromMnemonic(mnem, options);
-
-    const raw_sign_wallet = await createWalletFromMnemonic(
-      mnem,
-      prefix,
-      "m/44'/" + derivation + "'/0'/0/0"
-    );
-    console.log(
-      raw_sign_wallet.address,
-      raw_sign_wallet.publicKey,
-      wallet.mnemonic
-    );
-
-    const client = await SigningStargateClient.connectWithSigner(rpc, wallet);
-
-    let [firstAccount] = await wallet.getAccounts();
-
-    const wallet_address = firstAccount.address;
-
-    const check_account = await client.getAccount(wallet_address);
-
-    const fee = {
-      amount: coins(4000, denom),
-      gas: "222000", // 222k
-    };
-    let balance = await client.getBalance(wallet_address, denom);
-
-    console.log(balance);
-
-    if (DEBUG_MODE) {
-      console.error("ready to check account: " + JSON.stringify(check_account));
-      console.error("balance comes back as: " + JSON.stringify(balance));
-    }
-
-    if (
-      check_account === null ||
-      (balance.amount === "0" && balance.denom === denom)
-    ) {
-      console.log("account not found, sending to fee lender");
-      try {
-        let response = await fetch(
-          "https://fee-lender-worker.obiwallet.workers.dev/",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "text/plain",
-            },
-            body: decryptedMessage.chain + "," + wallet_address,
-          }
-        );
-
-        console.error("response from fee lender: " + JSON.stringify(response));
-        const check_account = await client.getAccount(wallet_address);
-        if (check_account != null) {
-          client.sendTokens(
-            wallet_address,
-            wallet_address,
-            coins(100, denom),
-            fee,
-            ""
-          );
-        }
-      } catch (error) {
-        console.error("error funding account: ", error);
+    case Intents.Sign: {
+      const { message } = rest;
+      if (!message) {
+        return c.json({ message: "Invalid request to " + intent });
       }
-    } else if (check_account.pubkey === null) {
-      const memo = "Activating Account";
-      await client.sendTokens(
-        wallet_address,
-        wallet_address,
-        coins(100, denom),
-        fee,
-        memo
-      );
-    }
-    // sanity check
-    if (raw_sign_wallet.address != wallet_address) {
-      console.error("ERROR: key mismatch!");
-      // this_intent = "fail";
-    }
-    if (DEBUG_MODE) {
-      console.error(
-        "pubkey in base64: " + bytesToBase64(raw_sign_wallet.publicKey)
-      );
-    }
+      const data = {
+        intent,
+        body: {
+          to,
+          via,
+          answer,
+          message,
+        },
+      };
 
-    switch (decryptedMessage.action) {
-      case "address":
-        console.log({ sender_address: wallet_address });
-        break;
-      case "pub":
-        console.log({ pubkey: bytesToBase64(raw_sign_wallet.publicKey) });
-        break;
-      case "sign":
-        console.error(
-          "sanity check, bytes to sign: " +
-            JSON.stringify(decryptedMessage.message) +
-            ", pubkey: " +
-            raw_sign_wallet.publicKey +
-            " and signature pending..."
-        );
-        const signedBytes = await ecdsaSign(
-          base64ToBytes(decryptedMessage.message),
-          raw_sign_wallet.privateKey
-        );
-        const convertedBytes = await bytesToBase64(signedBytes.signature);
-        console.log({ signed_message: convertedBytes });
-        break;
-      default:
-        console.log({
-          sender_address:
-            "create_use_key failed. Intent is: " + decryptedMessage.action,
-          pubkey:
-            "create_use_key failed. Intent is: " + decryptedMessage.action,
-          signed_message:
-            "create_use_key failed. Intent is: " + decryptedMessage.action,
+      if (!query.code) {
+        return await saveDataAndSendCode({
+          pubkey,
+          sendToNumber,
+          via,
+          c,
+          data,
         });
-    }
+      }
+      try {
+        await validateStoredData(pubkey, query.code, data, c);
+      } catch (e) {
+        const error = e as unknown as Error;
+        return c.json({ message: error.message }, 404);
+      }
 
-    return new Response("Hello world!", { status: 200 });
-  },
+      const signedData = ecdsaSign(base64ToBytes(message), wallet.privateKey);
+      const signature = bytesToBase64(signedData.signature);
+      return c.json({ signature });
+    }
+    case Intents.Pubkey: {
+      const data = {
+        intent,
+        body: {
+          to,
+          via,
+          answer,
+        },
+      };
+      if (!query.code) {
+        return await saveDataAndSendCode({
+          pubkey,
+          sendToNumber,
+          via,
+          c,
+          data,
+        });
+      }
+      try {
+        await validateStoredData(pubkey, query.code, data, c);
+      } catch (e) {
+        const error = e as unknown as Error;
+        return c.json({ message: error.message }, 404);
+      }
+      return c.json({ pubkey });
+    }
+    case Intents.Decrypt: {
+      const { encryptedMessages } = rest;
+      if (!encryptedMessages || encryptedMessages.length === 0) {
+        return c.json({ message: "Invalid request to " + intent }, 400);
+      }
+      const data = {
+        intent,
+        body: {
+          to,
+          via,
+          answer,
+          encryptedMessages,
+        },
+      };
+      if (!query.code) {
+        return await saveDataAndSendCode({
+          pubkey,
+          sendToNumber,
+          via,
+          c,
+          data,
+        });
+      }
+      try {
+        await validateStoredData(pubkey, query.code, data, c);
+      } catch (e) {
+        const error = e as unknown as Error;
+        return c.json({ message: error.message }, 404);
+      }
+      const decryptedMessages = await decryptM(encryptedMessages, wallet);
+
+      return c.json({ data: decryptedMessages });
+    }
+    default: {
+      return c.json({ message: "Invalid intent", intent });
+    }
+  }
+};
+
+app.options("*", async (c) => {
+  return c.json({ message: "ok" });
+});
+app.post("/:intent", handler, cors());
+app.post("/:intent/", handler, cors());
+
+app.fire();
+export default app;
+
+const manageCommunication = async (
+  data: ComunicationData,
+  c: Context,
+): Promise<TwilioResponse | TwilioError | undefined> => {
+  const { type, message, number } = data;
+  switch (type) {
+    case ComunicationType.SMS: {
+      console.log("SMS");
+      const twilio = new Twilio(c.env);
+      const twilioResponse = await twilio.sendText({
+        message: `Your magic Obi code is: ${message}`,
+        number,
+      });
+      return twilioResponse;
+    }
+    case ComunicationType.VOICE: {
+      console.log("VOICE");
+      const twilio = new Twilio(c.env);
+      return await twilio.requestCall({
+        message,
+        number,
+      });
+    }
+    case ComunicationType.TELEGRAM:
+      console.log("TELEGRAM");
+      await sendTelegramMessage(number, `Your magic Obi code is:`, c.env);
+      await sendTelegramMessage(number, `${message}`, c.env);
+      await sendTelegramMessage(number, `Copy and paste it in the app`, c.env);
+      return undefined;
+    default: {
+      throw new Error("Invalid communication type " + type);
+    }
+  }
 };

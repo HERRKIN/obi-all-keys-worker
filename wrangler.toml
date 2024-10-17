@@ -1,6 +1,10 @@
-name = "smsworker"
+name = "phone-keys"
 main = "src/index.ts"
 compatibility_date = "2023-07-11"
 node_compat = true
 usage_model = "unbound"
 workers_dev = true
+
+kv_namespaces = [
+    { binding = "MAGIC_CODES_KV", id = "fee75d664b7541d699a9ec91a29401c7" },
+]
